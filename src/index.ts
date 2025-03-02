@@ -25,6 +25,11 @@ import { generateRulesAndAlerts, deleteAllRules } from './commands/rules';
 
 const parseIntBase10 = (input: string) => parseInt(input, 10);
 
+program.command('tinkering').action(() => {
+  console.log('Tinkering');
+  generateTinkeringData();
+});
+
 program
   .command('generate-alerts')
   .option('-n <n>', 'number of alerts')

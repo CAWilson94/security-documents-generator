@@ -212,7 +212,7 @@ type TPartialDocument = Partial<TDocument>;
 const ingestAgents = async (agents: Agent[]) =>
   ingest(AGENT_INDEX_NAME, agents);
 
-const ingest = async (
+export const ingest = async (
   index: string,
   documents: Array<object>,
   mapping?: MappingTypeMapping,
@@ -235,6 +235,8 @@ const ingest = async (
         ) => {
           acc.push({ index: { _index: index } });
           acc.push(event);
+          console.log('Event pushed on: ', event);
+          console.log('Acc: ', acc);
           return acc;
         },
         [],
