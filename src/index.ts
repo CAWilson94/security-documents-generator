@@ -22,6 +22,7 @@ import { ENTITY_STORE_OPTIONS, generateNewSeed } from './constants';
 import { initializeSpace } from './utils/initialize_space';
 import { generateAssetCriticality } from './commands/asset_criticality';
 import { generateRulesAndAlerts, deleteAllRules } from './commands/rules';
+import { generateTinkeringData } from './commands/tinkering';
 
 const parseIntBase10 = (input: string) => parseInt(input, 10);
 
