@@ -146,13 +146,18 @@ export interface SeedRiskScoreHistoryOptions {
   clean?: boolean;
 }
 
-const fetchResolutionTargetIds = async (riskScoreIndex: string): Promise<Set<string>> => {
+const fetchResolutionGroupIds = async (riskScoreIndex: string): Promise<Set<string>> => {
   const esClient = getEsClient();
   const results = await esClient.search({
     index: riskScoreIndex,
     ignore_unavailable: true,
     size: 100,
-    _source: ['user.risk.id_value', 'host.risk.id_value'],
+    _source: [
+      'user.risk.id_value',
+      'host.risk.id_value',
+      'user.risk.related_entities',
+      'host.risk.related_entities',
+    ],
     query: {
       bool: {
         should: [
@@ -165,9 +170,17 @@ const fetchResolutionTargetIds = async (riskScoreIndex: string): Promise<Set<str
   });
   const ids = new Set<string>();
   for (const hit of results.hits.hits) {
-    const src = hit._source as Record<string, Record<string, Record<string, string>>>;
-    const id = src?.user?.risk?.id_value ?? src?.host?.risk?.id_value;
+    const src = hit._source as Record<string, Record<string, Record<string, unknown>>>;
+    const riskData = src?.user?.risk ?? src?.host?.risk;
+    if (!riskData) continue;
+    // Add resolution target
+    const id = riskData.id_value as string | undefined;
     if (id) ids.add(id);
+    // Add alias members (related_entities with relationship_type resolved_to)
+    const related = (riskData.related_entities ?? []) as Array<{ entity_id?: string }>;
+    for (const rel of related) {
+      if (rel?.entity_id) ids.add(rel.entity_id);
+    }
   }
   return ids;
 };
@@ -180,12 +193,12 @@ export const seedRiskScoreHistory = async (opts: SeedRiskScoreHistoryOptions) =>
   const [userHits, hostHits, resolutionTargetIds] = await Promise.all([
     fetchEntities(count, space, 'Identity'),
     fetchEntities(count, space, 'Host'),
-    fetchResolutionTargetIds(riskScoreIndex),
+    fetchResolutionGroupIds(riskScoreIndex),
   ]);
 
   if (resolutionTargetIds.size > 0) {
     log.info(
-      `Excluding ${resolutionTargetIds.size} resolution target(s) to avoid flyout conflicts.`,
+      `Excluding ${resolutionTargetIds.size} resolution group entities (targets + aliases) to avoid flyout conflicts.`,
     );
   }
 
