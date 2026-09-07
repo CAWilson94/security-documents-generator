@@ -30,7 +30,6 @@ export const applyV2Fields = (record: Record<string, unknown>): Record<string, u
   }
 
   const userNames = result['user.name'] as string[] | undefined;
-  const hostNames = result['host.name'] as string[] | undefined;
 
   if (userNames) {
     if (!(result['user.id'] as string[] | undefined)?.length) {
@@ -41,12 +40,9 @@ export const applyV2Fields = (record: Record<string, unknown>): Record<string, u
     }
   }
 
-  const existingHostIds = result['host.id'] as string[] | undefined;
-  if (hostNames) {
-    if (!existingHostIds?.length) {
-      result['host.id'] = hostNames.map((n) => `${n}-id`);
-    }
-  }
+  // Do NOT generate a synthetic host.id. The EUID ranking falls back to
+  // host.name when host.id is absent, which is correct for entity store
+  // entities that were ingested without a host.id field.
 
   const influencers = result.influencers as Influencer[] | undefined;
   if (influencers) {
