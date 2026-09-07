@@ -47,10 +47,12 @@ const assignScenarios = (
       yesterdayScore = randScore(5, 65);
       todayScore = randScore(72, 98);
     } else if (i < clampedNewlyHigh + clampedMover) {
-      // Delta ≥ 15, yesterday capped at 80 to guarantee room.
+      // Today score fixed at High (80–98) so the delta is ≥10 vs the real risk
+      // engine's typical stable score (~67–70). A relative offset from a seeded
+      // yesterday value can land below that threshold and produce a false negative.
       scenario = 'mover';
-      yesterdayScore = randScore(5, 75);
-      todayScore = randScore(yesterdayScore + 15, Math.min(yesterdayScore + 50, 100));
+      yesterdayScore = randScore(5, 65);
+      todayScore = randScore(80, 98);
     } else {
       // Stable: delta ≤ 5.
       scenario = 'stable';
