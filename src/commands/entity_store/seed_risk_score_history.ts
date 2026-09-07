@@ -146,20 +146,57 @@ export interface SeedRiskScoreHistoryOptions {
   clean?: boolean;
 }
 
+const fetchResolutionTargetIds = async (riskScoreIndex: string): Promise<Set<string>> => {
+  const esClient = getEsClient();
+  const results = await esClient.search({
+    index: riskScoreIndex,
+    ignore_unavailable: true,
+    size: 100,
+    _source: ['user.risk.id_value', 'host.risk.id_value'],
+    query: {
+      bool: {
+        should: [
+          { term: { 'user.risk.score_type': 'resolution' } },
+          { term: { 'host.risk.score_type': 'resolution' } },
+        ],
+        minimum_should_match: 1,
+      },
+    },
+  });
+  const ids = new Set<string>();
+  for (const hit of results.hits.hits) {
+    const src = hit._source as Record<string, Record<string, Record<string, string>>>;
+    const id = src?.user?.risk?.id_value ?? src?.host?.risk?.id_value;
+    if (id) ids.add(id);
+  }
+  return ids;
+};
+
 export const seedRiskScoreHistory = async (opts: SeedRiskScoreHistoryOptions) => {
   const { count, space, yesterdayHours, todayHours, newlyHighCount, moverCount, clean } = opts;
   const riskScoreIndex = `risk-score.risk-score-${space}`;
 
   log.info(`Fetching entities from entity store in space "${space}"...`);
-  const [userHits, hostHits] = await Promise.all([
+  const [userHits, hostHits, resolutionTargetIds] = await Promise.all([
     fetchEntities(count, space, 'Identity'),
     fetchEntities(count, space, 'Host'),
+    fetchResolutionTargetIds(riskScoreIndex),
   ]);
+
+  if (resolutionTargetIds.size > 0) {
+    log.info(
+      `Excluding ${resolutionTargetIds.size} resolution target(s) to avoid flyout conflicts.`,
+    );
+  }
 
   const allEntities = [
     ...userHits.map((entity) => ({ entity, entityType: 'user' as const })),
     ...hostHits.map((entity) => ({ entity, entityType: 'host' as const })),
-  ];
+  ].filter(({ entity }) => {
+    const src = entity._source;
+    const entityId = src?.entity?.id;
+    return !entityId || !resolutionTargetIds.has(entityId);
+  });
 
   if (allEntities.length === 0) {
     throw new Error(
@@ -168,7 +205,7 @@ export const seedRiskScoreHistory = async (opts: SeedRiskScoreHistoryOptions) =>
   }
 
   log.info(
-    `Found ${allEntities.length} entities (${userHits.length} users, ${hostHits.length} hosts).`,
+    `Found ${allEntities.length} entities (${userHits.length} users, ${hostHits.length} hosts) after excluding resolution targets.`,
   );
 
   const scored = assignScenarios(allEntities, newlyHighCount, moverCount);
