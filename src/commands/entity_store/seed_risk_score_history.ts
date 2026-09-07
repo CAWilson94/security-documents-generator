@@ -224,15 +224,23 @@ export const seedRiskScoreHistory = async (opts: SeedRiskScoreHistoryOptions) =>
   const allResults = [...yesterdayResults, ...todayResults];
 
   if (clean) {
-    const allIds = allResults.map(({ _id }) => _id);
-    log.info(`Deleting ${allIds.length} previously-seeded docs from ${riskScoreIndex}...`);
+    const seededIds = allResults.map(({ _id }) => _id);
+    // Also delete stale seeded docs for resolution targets (which are excluded from
+    // the current run). Without this, old seeded docs from a previous run remain as
+    // the most-recent doc for those entities and break the risk contributions flyout.
+    const staleResolutionIds = [...resolutionTargetIds].flatMap((entityId) => [
+      `seed-rsh-${space}-${entityId}-today`,
+      `seed-rsh-${space}-${entityId}-yesterday`,
+    ]);
+    const allIdsToDelete = [...seededIds, ...staleResolutionIds];
+    log.info(`Deleting ${allIdsToDelete.length} previously-seeded docs from ${riskScoreIndex}...`);
     const esClient = getEsClient();
     await esClient.deleteByQuery({
       index: riskScoreIndex,
       ignore_unavailable: true,
       // Target only our own seeded docs by their deterministic IDs — real risk engine
       // docs have auto-generated IDs and will not be matched.
-      query: { ids: { values: allIds } },
+      query: { ids: { values: allIdsToDelete } },
     });
     log.info('Clean complete.');
   }
