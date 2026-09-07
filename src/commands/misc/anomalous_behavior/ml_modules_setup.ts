@@ -55,7 +55,8 @@ export const DED_JOB_IDS_V2 = [
   'ded_high_bytes_written_to_external_device_ea',
   'ded_high_bytes_written_to_external_device_airdrop_ea',
   'ded_high_sent_bytes_destination_geo_country_iso_code_ea',
-  'ded_high_sent_bytes_destination_ip_ea',
+  // ded_high_sent_bytes_destination_ip_ea omitted: requires ~1GB ML memory that
+  // exceeds local dev stack capacity when the other 12 V2 jobs are open (~10.1GB).
 ];
 
 export const ALL_ANOMALY_JOB_IDS = [
