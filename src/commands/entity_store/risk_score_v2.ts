@@ -4995,18 +4995,24 @@ export const riskScoreV2Command = async (options: RiskScoreV2Options) => {
   log.info(
     'Maintainer run requested once. Collecting risk summary directly (without strict risk-score count gating).',
   );
-  await runTimedStage('report_summary', async () =>
-    reportRiskSummary({
-      space,
-      baselineRiskScoreCount,
-      baselineEntityCount,
-      expectedRiskDelta: Math.max(1, expectedNewEntityIds.length),
-      entityIds: allEntityIds,
-      pageSize,
-      expectedResolutionTargets: graphStats.resolutionTargetCount,
-      debugResolution: debugResolutionEnabled,
-    }),
-  );
+  // LOCAL XL PATCH: reportRiskSummary issues unchunked terms / size=N searches that exceed
+  // index.max_terms_count (65536) and index.max_result_window (10000) at scale.
+  if (allEntityIds.length <= 10_000) {
+    await runTimedStage('report_summary', async () =>
+      reportRiskSummary({
+        space,
+        baselineRiskScoreCount,
+        baselineEntityCount,
+        expectedRiskDelta: Math.max(1, expectedNewEntityIds.length),
+        entityIds: allEntityIds,
+        pageSize,
+        expectedResolutionTargets: graphStats.resolutionTargetCount,
+        debugResolution: debugResolutionEnabled,
+      }),
+    );
+  } else {
+    log.info(`Skipping report_summary for ${allEntityIds.length} entities (local XL patch).`);
+  }
   if (followOnEnabled && canUseInteractivePrompts()) {
     await runFollowOnActionLoop({
       space,
