@@ -33,7 +33,7 @@ const DELTA_WINDOWS = [
 ] as const;
 
 type DeltaWindow = (typeof DELTA_WINDOWS)[number];
-type SeedEntity =
+export type SeedEntity =
   | { kind: 'host'; entityId: string; host: HostIdentityForDed }
   | { kind: 'user'; entityId: string; user: UserIdentityForDed }
   | { kind: 'service'; entityId: string; serviceName: string };
@@ -51,7 +51,7 @@ interface IndexedCounts {
 }
 
 // Deterministic UUID-shaped string so re-runs produce identical rule/alert ids.
-const deterministicUuid = (seed: string): string => {
+export const deterministicUuid = (seed: string): string => {
   const h = createHash('sha256').update(seed).digest('hex');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 };
@@ -84,17 +84,20 @@ const toSeedEntity = (hit: EntityHit): SeedEntity | null => {
   }
 };
 
-const buildAlertDoc = (
+export const buildAlertDoc = (
   entity: SeedEntity,
   space: string,
   timestamp: number,
   alertUuid: string,
+  // When true the alert has no kibana.alert.entity.id, so the tile queries must derive the
+  // entity id from host/user fields (the heavier euid path).
+  omitEntityId = false,
 ): Record<string, unknown> => {
   const overrides = {
     'kibana.alert.uuid': alertUuid,
     'kibana.alert.rule.uuid': deterministicUuid(`seed-ad-rule-${space}`),
     'kibana.alert.rule.execution.uuid': deterministicUuid(`seed-ad-exec-${alertUuid}`),
-    'kibana.alert.entity.id': entity.entityId,
+    ...(omitEntityId ? {} : { 'kibana.alert.entity.id': entity.entityId }),
     'kibana.alert.workflow_status': 'open',
     'kibana.alert.severity': 'medium',
     'kibana.alert.rule.severity': 'medium',
@@ -139,7 +142,7 @@ const buildAlertDoc = (
 };
 
 // Reuse the DED generators so the anomaly shape matches generateAnomalousBehaviorDataWithMlJobs.
-const buildAnomalyDoc = (
+export const buildAnomalyDoc = (
   entity: SeedEntity,
   timestamp: number,
   windowIndex: number,
@@ -171,7 +174,7 @@ const buildAnomalyDoc = (
   };
 };
 
-const hasRealAtTimestamp = async (index: string): Promise<boolean> => {
+export const hasRealAtTimestamp = async (index: string): Promise<boolean> => {
   try {
     const res = await getEsClient().indices.getFieldMapping({ index, fields: '@timestamp' });
     return Object.values(res).some(
