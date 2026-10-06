@@ -407,7 +407,8 @@ export const seedDirectBulk = async (opts: SeedDirectBulkOptions): Promise<void>
       const pool = pools[kind];
       return pool[(Math.floor(j / kindsAvailable.length) * stride(pool.length)) % pool.length];
     };
-    const slotOf = (j: number) => j % SLOTS.length;
+    // The slot must not share a period with the kind (j % kinds), or each slot would only ever get one kind.
+    const slotOf = (j: number) => Math.floor(j / kindsAvailable.length) % SLOTS.length;
     const tsIn = (slot: number, seed: number) => {
       const [fromH, toH] = SLOTS[slot];
       return Math.floor(now - (fromH + rand(seed) * (toH - fromH)) * HOUR_MS);
