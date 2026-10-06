@@ -456,12 +456,52 @@ export const entityStoreCommands: CommandModule = {
         '--expected-out <file>',
         'write the counts this data should produce to this JSON file',
       )
+      .option(
+        '--risk-history <mode>',
+        'boundaries (7 fixed risk docs per entity) or series (risk docs on the sparkline bucket grid from first_seen, ~143 per entity)',
+        'boundaries',
+      )
+      .option(
+        '--alert-profile <mode>',
+        'slots (equal counts in six unequal windows) or uniform (even rate over --alert-horizon-days)',
+        'slots',
+      )
+      .option(
+        '--alert-horizon-days <n>',
+        'uniform profile only: alerts and anomalies land in the last N days (default 30)',
+      )
+      .option(
+        '--alert-entity-fraction <r>',
+        'fraction of entities (per kind) that can receive alerts and anomalies; below 1 makes them repeat (default 1)',
+      )
+      .option(
+        '--watchlisted-rate <r>',
+        'fraction of alert-eligible entities that carry a watchlist; creates the watchlist through Kibana (default 0)',
+      )
+      .option(
+        '--expected-series-out <file>',
+        'write the expected per-bucket series (alerts, watchlisted, anomalies, new entity, risk) to this JSON file',
+      )
       .action(
         wrapAction(async (options) => {
           const entities = parseOptionInt(options.entities, 10000);
           const rate = (v: string | undefined, d: number) => (v === undefined ? d : Number(v));
           if (!['both', 'host', 'user'].includes(options.kinds)) {
             log.error('--kinds must be both, host or user');
+            process.exit(1);
+          }
+          if (!['boundaries', 'series'].includes(options.riskHistory)) {
+            log.error('--risk-history must be boundaries or series');
+            process.exit(1);
+          }
+          if (!['slots', 'uniform'].includes(options.alertProfile)) {
+            log.error('--alert-profile must be slots or uniform');
+            process.exit(1);
+          }
+          const watchlistedRate = rate(options.watchlistedRate, 0);
+          const alertEntityFraction = rate(options.alertEntityFraction, 1);
+          if (![watchlistedRate, alertEntityFraction].every((r) => r >= 0 && r <= 1)) {
+            log.error('--watchlisted-rate and --alert-entity-fraction must be between 0 and 1');
             process.exit(1);
           }
           await seedDirectBulk({
@@ -480,6 +520,12 @@ export const entityStoreCommands: CommandModule = {
             concurrency: parseOptionInt(options.concurrency, 4),
             tuneIndices: options.tuneIndices !== false,
             expectedOut: options.expectedOut,
+            riskHistory: options.riskHistory,
+            alertProfile: options.alertProfile,
+            alertHorizonHours: parseOptionInt(options.alertHorizonDays, 30) * 24,
+            alertEntityFraction,
+            watchlistedRate,
+            expectedSeriesOut: options.expectedSeriesOut,
           });
         }),
       );

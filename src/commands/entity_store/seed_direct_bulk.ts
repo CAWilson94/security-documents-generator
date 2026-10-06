@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import { writeFileSync } from 'fs';
 import { log } from '../../utils/logger.ts';
 import { getAlertIndex } from '../../utils/index.ts';
+import { createWatchlist } from '../../utils/kibana_api.ts';
 import { getEsClient } from '../utils/indices.ts';
 import { parseUserHit, type EntityHit } from '../utils/entity_store.ts';
 import {
@@ -11,13 +12,26 @@ import {
   hasRealAtTimestamp,
   type SeedEntity,
 } from './seed_alert_deltas.ts';
+import {
+  HOUR_MS,
+  RISK_GRID_HOURS,
+  addRiskSeriesCounts,
+  between,
+  clamp,
+  createEventSeries,
+  createRiskSeriesCounts,
+  rand,
+  riskWalk,
+  scoreNormToLevel,
+  summarizeRiskSeries,
+} from './seed_series.ts';
 
-const HOUR_MS = 3_600_000;
 const SHARED_ANOMALIES_INDEX = '.ml-anomalies-shared';
 
 type Kind = 'host' | 'user';
 type KindsOption = 'both' | 'host' | 'user';
-type RiskLevel = 'Unknown' | 'Low' | 'Moderate' | 'High' | 'Critical';
+type RiskHistoryOption = 'boundaries' | 'series';
+type AlertProfileOption = 'slots' | 'uniform';
 
 export interface SeedDirectBulkOptions {
   space: string;
@@ -44,6 +58,24 @@ export interface SeedDirectBulkOptions {
   tuneIndices: boolean;
   /** Write the counts this data should produce to this JSON file, for later verification. */
   expectedOut?: string;
+  /**
+   * 'boundaries' writes the 7 fixed risk docs per entity. 'series' writes risk docs on the
+   * sparkline bucket grid (about 143 per entity) from each entity's first_seen, with scores
+   * that vary per point. In 'series' the mover and newly-high rates only shape each entity's
+   * score today (a 'mover' scenario gets a high score today); how many entities count as
+   * movers at a given point comes from the score walk, so those counts are emergent.
+   */
+  riskHistory: RiskHistoryOption;
+  /** 'slots' spreads alerts over six windows of unequal length; 'uniform' spreads them evenly. */
+  alertProfile: AlertProfileOption;
+  /** Only used by the 'uniform' profile: alerts and anomalies land in the last N hours. */
+  alertHorizonHours: number;
+  /** Fraction of entities (per kind) that can receive alerts and anomalies; below 1 makes them repeat. */
+  alertEntityFraction: number;
+  /** Fraction of the alert-eligible entities that carry a watchlist. Needs a running Kibana. */
+  watchlistedRate: number;
+  /** Write the expected per-bucket series (alerts, anomalies, new entity, risk) to this file. */
+  expectedSeriesOut?: string;
 }
 
 // Comparison slots (hours ago). 24h current = S1, 24h prev = S2; 7d current = S1..S3, prev = S4;
@@ -69,27 +101,7 @@ const RISK_SLOTS = [
   { slot: 'prev-30d', hoursAgo: 1441, which: 'prev' },
 ] as const;
 
-// Real Kibana risk score level boundaries (same as seed_risk_score_history.ts).
-const scoreNormToLevel = (score: number): RiskLevel => {
-  if (score < 20) return 'Unknown';
-  if (score < 40) return 'Low';
-  if (score < 70) return 'Moderate';
-  if (score < 90) return 'High';
-  return 'Critical';
-};
-
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
-
-// Deterministic uniform [0,1) from an integer seed (mulberry32), so runs are reproducible.
-const rand = (seed: number): number => {
-  let t = (seed + 0x6d2b79f5) | 0;
-  t = Math.imul(t ^ (t >>> 15), t | 1);
-  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-};
-
-const clamp = (v: number): number => Math.max(0, Math.min(100, Math.round(v * 100) / 100));
-const between = (seed: number, min: number, max: number): number => min + rand(seed) * (max - min);
 
 const kindOf = (index: number, kinds: KindsOption): Kind => {
   if (kinds === 'host') return 'host';
@@ -165,13 +177,23 @@ interface BuiltEntity {
   doc: Record<string, unknown>;
   seed: SeedEntity;
   scores: Scores & { scenario: Scenario };
+  /** Hours between first_seen and now. */
+  ageHours: number;
 }
 
-const buildEntity = (index: number, now: number, opts: SeedDirectBulkOptions): BuiltEntity => {
+const buildEntity = (
+  index: number,
+  now: number,
+  opts: SeedDirectBulkOptions,
+  watchlistIds: readonly string[] = [],
+): BuiltEntity => {
   const kind = kindOf(index, opts.kinds);
   const scores = scoresFor(index, opts);
   // first_seen spread over the last 90 days so the New entity tile has current and previous hits.
-  const firstSeen = new Date(now - between(index * 17 + 5, 0, 90 * 24) * HOUR_MS).toISOString();
+  const ageHours = between(index * 17 + 5, 0, 90 * 24);
+  const firstSeen = new Date(now - ageHours * HOUR_MS).toISOString();
+  const attributes =
+    watchlistIds.length > 0 ? { attributes: { watchlists: [...watchlistIds] } } : {};
   const nowIso = new Date(now).toISOString();
   const risk = {
     calculated_score: scores.today,
@@ -196,6 +218,7 @@ const buildEntity = (index: number, now: number, opts: SeedDirectBulkOptions): B
         source: 'okta',
         id: entityId,
         type: 'Host',
+        ...attributes,
       },
     };
     return {
@@ -203,6 +226,7 @@ const buildEntity = (index: number, now: number, opts: SeedDirectBulkOptions): B
       entityId,
       doc,
       scores,
+      ageHours,
       seed: { kind: 'host', entityId, host: { id: hostId, name: hostName } },
     };
   }
@@ -225,19 +249,36 @@ const buildEntity = (index: number, now: number, opts: SeedDirectBulkOptions): B
       source: 'okta',
       id: entityId,
       type: 'Identity',
+      ...attributes,
     },
   };
   const hit: EntityHit = { _id: sha256(entityId), _index: 'direct', _source: doc };
   const user = parseUserHit(hit);
   if (!user) throw new Error(`parseUserHit rejected synthetic user ${entityId}`);
-  return { kind, entityId, doc, scores, seed: { kind: 'user', entityId, user } };
+  return { kind, entityId, doc, scores, ageHours, seed: { kind: 'user', entityId, user } };
 };
 
-const buildRiskDocs = (
-  e: BuiltEntity,
-  now: number,
-  space: string,
-): Array<{ _id: string; doc: Record<string, unknown> }> =>
+type Doc = { _id: string; doc: Record<string, unknown> };
+
+const buildRiskDoc = (e: BuiltEntity, id: string, timestampMs: number, score: number): Doc => ({
+  _id: id,
+  doc: {
+    '@timestamp': new Date(timestampMs).toISOString(),
+    [e.kind]: {
+      name: e.entityId,
+      risk: {
+        calculated_score: score,
+        calculated_score_norm: score,
+        calculated_level: scoreNormToLevel(score),
+        id_field: 'entity.id',
+        id_value: e.entityId,
+        score_type: 'base',
+      },
+    },
+  },
+});
+
+const buildRiskDocs = (e: BuiltEntity, now: number, space: string): Doc[] =>
   RISK_SLOTS.map(({ slot, hoursAgo, which }) => {
     const score =
       which === 'today'
@@ -245,26 +286,35 @@ const buildRiskDocs = (
         : which === 'yesterday'
           ? e.scores.yesterday
           : e.scores.prev;
-    return {
-      _id: `seed-direct-${space}-${e.entityId}-${slot}`,
-      doc: {
-        '@timestamp': new Date(now - hoursAgo * HOUR_MS).toISOString(),
-        [e.kind]: {
-          name: e.entityId,
-          risk: {
-            calculated_score: score,
-            calculated_score_norm: score,
-            calculated_level: scoreNormToLevel(score),
-            id_field: 'entity.id',
-            id_value: e.entityId,
-            score_type: 'base',
-          },
-        },
-      },
-    };
+    return buildRiskDoc(
+      e,
+      `seed-direct-${space}-${e.entityId}-${slot}`,
+      now - hoursAgo * HOUR_MS,
+      score,
+    );
   });
 
-type Doc = { _id: string; doc: Record<string, unknown> };
+// One doc per risk grid time from today back to the entity's first_seen.
+const buildSeriesRiskDocs = (
+  e: BuiltEntity,
+  scores: Float64Array,
+  now: number,
+  space: string,
+): Doc[] => {
+  const docs: Doc[] = [];
+  RISK_GRID_HOURS.forEach((hoursAgo, i) => {
+    if (Number.isNaN(scores[i])) return;
+    docs.push(
+      buildRiskDoc(
+        e,
+        `seed-direct-${space}-${e.entityId}-h${hoursAgo}`,
+        now - hoursAgo * HOUR_MS,
+        scores[i],
+      ),
+    );
+  });
+  return docs;
+};
 
 const bulkIndex = async (
   index: string,
@@ -347,14 +397,49 @@ export const seedDirectBulk = async (opts: SeedDirectBulkOptions): Promise<void>
 
   log.info(
     `Direct bulk seed: ${entities} entities from index ${startIndex} (${opts.kinds}), ` +
-      `${opts.alertsTotal} alerts, ${opts.anomaliesTotal} anomalies, into ${entityIndex}`,
+      `${opts.alertsTotal} alerts, ${opts.anomaliesTotal} anomalies, into ${entityIndex} ` +
+      `(risk history: ${opts.riskHistory}, alert profile: ${opts.alertProfile})`,
   );
+
+  const seriesRisk = opts.riskHistory === 'series';
+  const wantSeries = Boolean(opts.expectedSeriesOut);
+  const kindsAvailable: Kind[] = opts.kinds === 'both' ? ['host', 'user'] : [opts.kinds];
+
+  // Alerts and anomalies go to the first `poolSize(kind)` entities of each kind, so a fraction
+  // below 1 makes them repeat. Watchlists are only stamped on entities inside that pool.
+  const poolFraction = Math.min(1, Math.max(0, opts.alertEntityFraction));
+  const kindTotals: Record<Kind, number> = { host: 0, user: 0 };
+  for (let i = 0; i < entities; i++) kindTotals[kindOf(startIndex + i, opts.kinds)]++;
+  const poolSize = (kind: Kind): number =>
+    kindTotals[kind] === 0 ? 0 : Math.max(1, Math.floor(kindTotals[kind] * poolFraction));
+  const isWatchlisted = (index: number): boolean =>
+    opts.watchlistedRate > 0 && rand(index * 19 + 3) < opts.watchlistedRate;
+
+  const watchlistIds: string[] = [];
+  if (opts.watchlistedRate > 0) {
+    const watchlist = await createWatchlist({
+      name: `nat-perf-watchlist-${now}`,
+      riskModifier: 1.5,
+      space,
+    });
+    watchlistIds.push(watchlist.id);
+    log.info(`Created watchlist ${watchlist.name} (${watchlist.id})`);
+  }
 
   const savedSettings = new Map<string, string | undefined>();
   const tunedIndices = [entityIndex, riskIndex, alertIndex, SHARED_ANOMALIES_INDEX];
   if (opts.tuneIndices) await tune(tunedIndices, true, savedSettings);
 
+  const riskCounts = wantSeries && seriesRisk ? createRiskSeriesCounts() : undefined;
+  const alertSeries = wantSeries ? createEventSeries(now) : undefined;
+  const watchlistedSeries = wantSeries ? createEventSeries(now) : undefined;
+  const anomalySeries = wantSeries ? createEventSeries(now) : undefined;
+  const newEntitySeries = wantSeries ? createEventSeries(now) : undefined;
+
+  // The mover and newly-high counts below only describe 'boundaries' history; for 'series' see
+  // the --expected-series-out file.
   const expected = {
+    riskHistory: opts.riskHistory,
     entities: { host: 0, user: 0 },
     curMovers: 0,
     prevMovers: 0,
@@ -368,22 +453,35 @@ export const seedDirectBulk = async (opts: SeedDirectBulkOptions): Promise<void>
   };
 
   try {
-    // Entities + risk docs, in blocks to bound memory.
-    const BLOCK = 50_000;
+    // Entities + risk docs, in blocks to bound memory (series history is ~20x more risk docs).
+    const BLOCK = seriesRisk ? Math.max(200, Math.floor(300_000 / RISK_GRID_HOURS.length)) : 50_000;
     const started = Date.now();
     const hostIdx: number[] = [];
     const userIdx: number[] = [];
+    const positions: Record<Kind, number> = { host: 0, user: 0 };
     for (let block = 0; block < entities; block += BLOCK) {
       const count = Math.min(BLOCK, entities - block);
       const entityDocs: Doc[] = [];
       const riskDocs: Doc[] = [];
       for (let i = 0; i < count; i++) {
         const index = startIndex + block + i;
-        const e = buildEntity(index, now, opts);
+        const kind = kindOf(index, opts.kinds);
+        const watched = isWatchlisted(index) && positions[kind] < poolSize(kind);
+        positions[kind]++;
+        const e = buildEntity(index, now, opts, watched ? watchlistIds : []);
         entityDocs.push({ _id: sha256(e.entityId), doc: e.doc });
-        riskDocs.push(...buildRiskDocs(e, now, space));
         (e.kind === 'host' ? hostIdx : userIdx).push(index);
         expected.entities[e.kind]++;
+        if (e.scores.today > 0) {
+          newEntitySeries?.add(Math.trunc(now - e.ageHours * HOUR_MS), index);
+        }
+        if (seriesRisk) {
+          const scores = riskWalk(index, e.scores.today, e.ageHours);
+          riskDocs.push(...buildSeriesRiskDocs(e, scores, now, space));
+          if (riskCounts) addRiskSeriesCounts(riskCounts, scores);
+          continue;
+        }
+        riskDocs.push(...buildRiskDocs(e, now, space));
         if (e.scores.today - e.scores.yesterday >= 10) expected.curMovers++;
         if (e.scores.yesterday - e.scores.prev >= 10) expected.prevMovers++;
         if (e.scores.today >= 70 && e.scores.yesterday < 70) expected.curNewlyHighCritical++;
@@ -398,20 +496,31 @@ export const seedDirectBulk = async (opts: SeedDirectBulkOptions): Promise<void>
       );
     }
 
-    // Alerts and anomalies: spread over distinct entities, alternating host/user, six slots.
-    const kindsAvailable: Kind[] = opts.kinds === 'both' ? ['host', 'user'] : [opts.kinds];
+    // Alerts and anomalies: alternating host/user, spread over the alert-eligible entities.
     const pools: Record<Kind, number[]> = { host: hostIdx, user: userIdx };
     const stride = (n: number) => (n % 7919 === 0 ? 7907 : 7919);
     const pickEntity = (j: number): number => {
       const kind = kindsAvailable[j % kindsAvailable.length];
       const pool = pools[kind];
-      return pool[(Math.floor(j / kindsAvailable.length) * stride(pool.length)) % pool.length];
+      const size = Math.min(pool.length, poolSize(kind));
+      return pool[(Math.floor(j / kindsAvailable.length) * stride(size)) % size];
     };
     // The slot must not share a period with the kind (j % kinds), or each slot would only ever get one kind.
     const slotOf = (j: number) => Math.floor(j / kindsAvailable.length) % SLOTS.length;
-    const tsIn = (slot: number, seed: number) => {
+    const slotOfTimestamp = (timestampMs: number) => {
+      const hoursAgo = (now - timestampMs) / HOUR_MS;
+      const slot = SLOTS.findIndex(([fromH, toH]) => hoursAgo >= fromH && hoursAgo < toH);
+      return slot === -1 ? SLOTS.length - 1 : slot;
+    };
+    // 'slots': equal counts per slot, so a short slot is denser. 'uniform': an even rate over time.
+    const eventTime = (j: number, seed: number): { slot: number; timestamp: number } => {
+      if (opts.alertProfile === 'uniform') {
+        const timestamp = Math.floor(now - rand(seed) * opts.alertHorizonHours * HOUR_MS);
+        return { slot: slotOfTimestamp(timestamp), timestamp };
+      }
+      const slot = slotOf(j);
       const [fromH, toH] = SLOTS[slot];
-      return Math.floor(now - (fromH + rand(seed) * (toH - fromH)) * HOUR_MS);
+      return { slot, timestamp: Math.floor(now - (fromH + rand(seed) * (toH - fromH)) * HOUR_MS) };
     };
 
     const alertDocs: Doc[] = [];
@@ -419,19 +528,21 @@ export const seedDirectBulk = async (opts: SeedDirectBulkOptions): Promise<void>
     for (let j = 0; j < opts.alertsTotal; j++) {
       const index = pickEntity(j);
       const e = buildEntity(index, now, opts);
-      const slot = slotOf(j);
+      const { slot, timestamp } = eventTime(j, j * 31 + 7);
       const _id = `seed-direct-alert-${space}-${e.entityId}-${j}`;
       alertDocs.push({
         _id,
         doc: buildAlertDoc(
           e.seed,
           space,
-          tsIn(slot, j * 31 + 7),
+          timestamp,
           deterministicUuid(_id),
           opts.omitAlertEntityId,
         ),
       });
       expected.alertsBySlot[slot]++;
+      alertSeries?.add(timestamp, index);
+      if (isWatchlisted(index)) watchlistedSeries?.add(timestamp, index);
     }
     const alertCounts = await bulkIndex(alertIndex, 'create', alertDocs, opts);
     expected.alerts = alertDocs.length;
@@ -442,11 +553,12 @@ export const seedDirectBulk = async (opts: SeedDirectBulkOptions): Promise<void>
     for (let j = 0; j < opts.anomaliesTotal; j++) {
       const index = pickEntity(j + 1_000_003);
       const e = buildEntity(index, now, opts);
-      const slot = slotOf(j);
-      const doc = buildAnomalyDoc(e.seed, tsIn(slot, j * 53 + 11), slot, writeAtTimestamp);
+      const { slot, timestamp } = eventTime(j, j * 53 + 11);
+      const doc = buildAnomalyDoc(e.seed, timestamp, slot, writeAtTimestamp);
       if (!doc) continue;
       anomalyDocs.push({ _id: `seed-direct-anom-${space}-${e.entityId}-${j}`, doc });
       expected.anomaliesBySlot[slot]++;
+      anomalySeries?.add(timestamp, index);
     }
     const anomalyCounts = await bulkIndex(SHARED_ANOMALIES_INDEX, 'create', anomalyDocs, opts);
     expected.anomalies = anomalyDocs.length;
@@ -459,5 +571,29 @@ export const seedDirectBulk = async (opts: SeedDirectBulkOptions): Promise<void>
 
   log.info(`Expected: ${JSON.stringify(expected)}`);
   if (opts.expectedOut) writeFileSync(opts.expectedOut, JSON.stringify(expected, null, 2));
+  if (
+    opts.expectedSeriesOut &&
+    alertSeries &&
+    watchlistedSeries &&
+    anomalySeries &&
+    newEntitySeries
+  ) {
+    // Event buckets are UTC-aligned like ES|QL BUCKET and cover [windowFrom, seededAt]; check
+    // them with those fixed bounds, because NOW() in a later query shifts the first bucket.
+    const series = {
+      seededAt: new Date(now).toISOString(),
+      entityCount: entities,
+      startIndex,
+      riskHistory: opts.riskHistory,
+      alertProfile: opts.alertProfile,
+      entitiesWithAlerts: alertSeries.summarize(),
+      watchlisted: watchlistedSeries.summarize(),
+      anomalies: anomalySeries.summarize(),
+      newEntity: newEntitySeries.summarize(),
+      ...(riskCounts && { risk: summarizeRiskSeries(riskCounts, now) }),
+    };
+    writeFileSync(opts.expectedSeriesOut, JSON.stringify(series, null, 2));
+    log.info(`Expected series written to ${opts.expectedSeriesOut}`);
+  }
   log.info('Direct bulk seed complete.');
 };
