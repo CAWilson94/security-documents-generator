@@ -21,6 +21,7 @@ import { riskScoreV2Command } from './risk_score_v2.ts';
 import { seedRiskScoreHistory } from './seed_risk_score_history.ts';
 import { natPerfCommand } from './nat_perf.ts';
 import { seedAlertDeltasCommand } from './seed_alert_deltas_command.ts';
+import { seedDirectBulk } from './seed_direct_bulk.ts';
 import { parseOptionInt } from '../utils/cli_utils.ts';
 
 export const entityStoreCommands: CommandModule = {
@@ -406,6 +407,125 @@ export const entityStoreCommands: CommandModule = {
               options.anomalyCount !== undefined
                 ? parseOptionInt(options.anomalyCount, Math.floor(count * 0.5))
                 : undefined,
+          });
+        }),
+      );
+
+    program
+      .command('seed-direct-bulk')
+      .description(
+        'Seed entities, risk history (current + previous-period boundary docs), alerts and anomalies straight into Elasticsearch with parallel bulk writes, bypassing Kibana. Built for 100k-10M entity scale tests of the NAT tiles.',
+      )
+      .option('--space <space>', 'Kibana space ID', 'default')
+      .option('--entities <n>', 'entities to create in this run (default 10000)')
+      .option(
+        '--start-index <n>',
+        'first entity index; use the previous total to extend (default 0)',
+      )
+      .option('--kinds <kinds>', 'both (50/50 host/user), host or user (default both)', 'both')
+      .option(
+        '--alerts-total <n>',
+        'total alerts, spread over distinct entities (default 3% of entities)',
+      )
+      .option('--anomalies-total <n>', 'total anomaly records (default 1% of entities)')
+      .option(
+        '--cur-mover-rate <r>',
+        'fraction of entities that are current-period risk movers (default 0.02)',
+      )
+      .option(
+        '--prev-mover-rate <r>',
+        'fraction that are previous-period risk movers (default 0.02)',
+      )
+      .option(
+        '--cur-newly-high-rate <r>',
+        'fraction newly high/critical this period (default 0.01)',
+      )
+      .option(
+        '--prev-newly-high-rate <r>',
+        'fraction newly high/critical last period (default 0.01)',
+      )
+      .option(
+        '--with-alert-entity-id',
+        'set kibana.alert.entity.id on alerts (default: omitted, euid derivation path)',
+        false,
+      )
+      .option('--bulk-size <n>', 'docs per bulk request (default 5000)')
+      .option('--concurrency <n>', 'parallel bulk requests (default 4)')
+      .option('--no-tune-indices', 'do not disable replicas/refresh while loading')
+      .option(
+        '--expected-out <file>',
+        'write the counts this data should produce to this JSON file',
+      )
+      .option(
+        '--risk-history <mode>',
+        'boundaries (7 fixed risk docs per entity) or series (risk docs on the sparkline bucket grid from first_seen, ~143 per entity)',
+        'boundaries',
+      )
+      .option(
+        '--alert-profile <mode>',
+        'slots (equal counts in six unequal windows) or uniform (even rate over --alert-horizon-days)',
+        'slots',
+      )
+      .option(
+        '--alert-horizon-days <n>',
+        'uniform profile only: alerts and anomalies land in the last N days (default 30)',
+      )
+      .option(
+        '--alert-entity-fraction <r>',
+        'fraction of entities (per kind) that can receive alerts and anomalies; below 1 makes them repeat (default 1)',
+      )
+      .option(
+        '--watchlisted-rate <r>',
+        'fraction of alert-eligible entities that carry a watchlist; creates the watchlist through Kibana (default 0)',
+      )
+      .option(
+        '--expected-series-out <file>',
+        'write the expected per-bucket series (alerts, watchlisted, anomalies, new entity, risk) to this JSON file',
+      )
+      .action(
+        wrapAction(async (options) => {
+          const entities = parseOptionInt(options.entities, 10000);
+          const rate = (v: string | undefined, d: number) => (v === undefined ? d : Number(v));
+          if (!['both', 'host', 'user'].includes(options.kinds)) {
+            log.error('--kinds must be both, host or user');
+            process.exit(1);
+          }
+          if (!['boundaries', 'series'].includes(options.riskHistory)) {
+            log.error('--risk-history must be boundaries or series');
+            process.exit(1);
+          }
+          if (!['slots', 'uniform'].includes(options.alertProfile)) {
+            log.error('--alert-profile must be slots or uniform');
+            process.exit(1);
+          }
+          const watchlistedRate = rate(options.watchlistedRate, 0);
+          const alertEntityFraction = rate(options.alertEntityFraction, 1);
+          if (![watchlistedRate, alertEntityFraction].every((r) => r >= 0 && r <= 1)) {
+            log.error('--watchlisted-rate and --alert-entity-fraction must be between 0 and 1');
+            process.exit(1);
+          }
+          await seedDirectBulk({
+            space: options.space ?? 'default',
+            entities,
+            startIndex: parseOptionInt(options.startIndex, 0),
+            kinds: options.kinds,
+            alertsTotal: parseOptionInt(options.alertsTotal, Math.round(entities * 0.03)),
+            anomaliesTotal: parseOptionInt(options.anomaliesTotal, Math.round(entities * 0.01)),
+            curMoverRate: rate(options.curMoverRate, 0.02),
+            prevMoverRate: rate(options.prevMoverRate, 0.02),
+            curNewlyHighRate: rate(options.curNewlyHighRate, 0.01),
+            prevNewlyHighRate: rate(options.prevNewlyHighRate, 0.01),
+            omitAlertEntityId: !options.withAlertEntityId,
+            bulkSize: parseOptionInt(options.bulkSize, 5000),
+            concurrency: parseOptionInt(options.concurrency, 4),
+            tuneIndices: options.tuneIndices !== false,
+            expectedOut: options.expectedOut,
+            riskHistory: options.riskHistory,
+            alertProfile: options.alertProfile,
+            alertHorizonHours: parseOptionInt(options.alertHorizonDays, 30) * 24,
+            alertEntityFraction,
+            watchlistedRate,
+            expectedSeriesOut: options.expectedSeriesOut,
           });
         }),
       );
